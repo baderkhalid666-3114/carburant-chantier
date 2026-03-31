@@ -1,0 +1,762 @@
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Carburant Chantier — V2</title>
+  <script type="module">
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+    const SUPABASE_URL = "https://mhstrimiwvptjxdqzv.supabase.co";
+    const SUPABASE_ANON_KEY = "sb_publishable_qxcFZIJDJ07vsSUcEGLB8A_QWJOe-Nw";
+    const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+    const DEFAULT_ENGINS = [
+      { nom:"Engins ST Terrassier", categorie:"Engins lourds", affectation_defaut:"ST Terrassier" },
+      { nom:"Bulldozer", categorie:"Engins lourds", affectation_defaut:"Jet" },
+      { nom:"Mini-pelle", categorie:"Engins lourds", affectation_defaut:"Jet" },
+      { nom:"Grue Mobile", categorie:"Engins lourds", affectation_defaut:"Jet" },
+      { nom:"Compacteur", categorie:"Engins lourds", affectation_defaut:"Location" },
+      { nom:"Camion 8*4", categorie:"Engins lourds", affectation_defaut:"Location" },
+      { nom:"Groupe électrogène 1", categorie:"Matériel", affectation_defaut:"Jet" },
+      { nom:"Groupe électrogène 2", categorie:"Matériel", affectation_defaut:"Jet" },
+      { nom:"Compresseur", categorie:"Matériel", affectation_defaut:"Jet" },
+      { nom:"Autocar", categorie:"Véhicules", affectation_defaut:"Location" },
+      { nom:"Camion citerne", categorie:"Véhicules", affectation_defaut:"Location" },
+      { nom:"Manitou", categorie:"Véhicules", affectation_defaut:"Location" },
+      { nom:"Transport MCA", categorie:"Véhicules", affectation_defaut:"Location" },
+      { nom:"Voiture Bader", categorie:"Véhicules", affectation_defaut:"Jet" },
+      { nom:"Voiture Abdrahim", categorie:"Véhicules", affectation_defaut:"Jet" },
+      { nom:"Oued YKEM", categorie:"Autre", affectation_defaut:"Oued YKEM" },
+    ];
+    const AFFECTATIONS = ["ST Terrassier","Jet","Location","Oued YKEM","N/A"];
+
+    const state = {
+      session: null,
+      profile: null,
+      engins: [],
+      saisies: [],
+      pointages: [],
+      currentDate: today(),
+    };
+
+    const el = (sel) => document.querySelector(sel);
+    const els = (sel) => Array.from(document.querySelectorAll(sel));
+    const fmt = (n) => Number(n || 0).toLocaleString("fr-FR", { maximumFractionDigits: 2 });
+    function today(){ return new Date().toISOString().slice(0,10); }
+    function fmtDate(d){
+      if (!d) return "—";
+      const dt = new Date(d + "T12:00:00");
+      return dt.toLocaleDateString("fr-FR");
+    }
+    function toast(msg, type="info"){
+      const t = el("#toast");
+      t.className = `toast ${type} show`;
+      t.textContent = msg;
+      setTimeout(() => t.classList.remove("show"), 2600);
+    }
+    function csvEscape(v){
+      const s = String(v ?? "");
+      return `"${s.replaceAll('"', '""')}"`;
+    }
+    function downloadCsv(filename, rows){
+      const csv = rows.map(r => r.map(csvEscape).join(",")).join("\n");
+      const blob = new Blob(["\uFEFF"+csv], { type:"text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+    function roleLabel(role){
+      return role === "admin" ? "Admin" : role === "magasinier" ? "Magasinier" : "Pointeur";
+    }
+    function canManageFuel(){ return ["admin","magasinier"].includes(state.profile?.role); }
+    function canManagePointage(){ return ["admin","pointeur"].includes(state.profile?.role); }
+
+    async function ensureProfile(user, fullName, role){
+      let safeRole = role;
+      if (!["magasinier","pointeur"].includes(safeRole)) safeRole = "magasinier";
+      const { error } = await supabase.from("profiles").upsert({
+        id: user.id,
+        full_name: fullName,
+        role: safeRole,
+        is_active: true,
+      });
+      if (error) throw error;
+    }
+
+    async function loadProfile(){
+      const user = state.session?.user;
+      if (!user) return null;
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("id", user.id)
+        .maybeSingle();
+      if (error) throw error;
+      state.profile = data;
+      return data;
+    }
+
+    async function bootstrapIfNeeded(){
+      if (!state.profile) return;
+      const { count, error } = await supabase
+        .from("engins")
+        .select("*", { count:"exact", head:true });
+      if (error) throw error;
+      if ((count || 0) === 0 && state.profile.role === "admin") {
+        const payload = DEFAULT_ENGINS.map(e => ({ ...e, is_active: true }));
+        const res = await supabase.from("engins").insert(payload);
+        if (res.error) throw res.error;
+      }
+    }
+
+    async function loadAllData(){
+      const [enginsRes, saisiesRes, pointagesRes] = await Promise.all([
+        supabase.from("engins").select("*").order("categorie").order("nom"),
+        supabase.from("saisies_carburant").select("*, engins(nom)").order("date_saisie", { ascending:false }).order("created_at", { ascending:false }).limit(500),
+        supabase.from("pointages_engins").select("*, engins(nom)").order("date_pointage", { ascending:false }).limit(500),
+      ]);
+      if (enginsRes.error) throw enginsRes.error;
+      if (saisiesRes.error) throw saisiesRes.error;
+      if (pointagesRes.error) throw pointagesRes.error;
+      state.engins = enginsRes.data || [];
+      state.saisies = saisiesRes.data || [];
+      state.pointages = pointagesRes.data || [];
+    }
+
+    function stockActuel(){
+      const e = state.saisies.filter(x => x.type_mouvement === "E").reduce((a,x)=>a+Number(x.quantite_l||0),0);
+      const s = state.saisies.filter(x => x.type_mouvement === "S").reduce((a,x)=>a+Number(x.quantite_l||0),0);
+      return e - s;
+    }
+
+    function renderAuth(){
+      el("#app").innerHTML = `
+        <section class="auth-wrap">
+          <div class="auth-card">
+            <div class="brand">⛽</div>
+            <h1>Carburant Chantier</h1>
+            <p class="sub">Version multi-utilisateur — téléphone + PC</p>
+            <div class="tabs small">
+              <button class="tab-btn active" data-auth-tab="login">Connexion</button>
+              <button class="tab-btn" data-auth-tab="signup">Inscription</button>
+            </div>
+
+            <form id="login-form" class="stack">
+              <label>Email</label>
+              <input type="email" id="login-email" required placeholder="nom@entreprise.com" />
+              <label>Mot de passe</label>
+              <input type="password" id="login-password" required placeholder="••••••••" />
+              <button class="btn primary">Se connecter</button>
+            </form>
+
+            <form id="signup-form" class="stack hidden">
+              <label>Nom complet</label>
+              <input type="text" id="signup-name" required placeholder="Nom Prénom" />
+              <label>Email</label>
+              <input type="email" id="signup-email" required placeholder="nom@entreprise.com" />
+              <label>Mot de passe</label>
+              <input type="password" id="signup-password" required placeholder="Minimum 6 caractères" />
+              <label>Rôle</label>
+              <select id="signup-role">
+                <option value="magasinier">Magasinier</option>
+                <option value="pointeur">Pointeur</option>
+              </select>
+              <button class="btn primary">Créer un compte</button>
+              <p class="hint">Compte admin : à définir manuellement dans Supabase après création.</p>
+            </form>
+          </div>
+        </section>
+      `;
+      els("[data-auth-tab]").forEach(btn => {
+        btn.onclick = () => {
+          els("[data-auth-tab]").forEach(b => b.classList.remove("active"));
+          btn.classList.add("active");
+          el("#login-form").classList.toggle("hidden", btn.dataset.authTab !== "login");
+          el("#signup-form").classList.toggle("hidden", btn.dataset.authTab !== "signup");
+        };
+      });
+      el("#login-form").onsubmit = async (e) => {
+        e.preventDefault();
+        try {
+          const email = el("#login-email").value.trim();
+          const password = el("#login-password").value;
+          const { error } = await supabase.auth.signInWithPassword({ email, password });
+          if (error) throw error;
+          toast("Connexion réussie", "ok");
+        } catch (err) {
+          toast(err.message || "Erreur de connexion", "err");
+        }
+      };
+      el("#signup-form").onsubmit = async (e) => {
+        e.preventDefault();
+        try {
+          const fullName = el("#signup-name").value.trim();
+          const email = el("#signup-email").value.trim();
+          const password = el("#signup-password").value;
+          const role = el("#signup-role").value;
+          const { data, error } = await supabase.auth.signUp({ email, password });
+          if (error) throw error;
+          if (data.user) {
+            await ensureProfile(data.user, fullName, role);
+          }
+          toast("Compte créé. Vérifie ton email si Supabase demande confirmation.", "ok");
+        } catch (err) {
+          toast(err.message || "Erreur d'inscription", "err");
+        }
+      };
+    }
+
+    function pageHeader(){
+      return `
+        <header class="topbar">
+          <div>
+            <div class="eyebrow">Viaduc Oued Cherrat</div>
+            <h2>Carburant chantier</h2>
+            <div class="sub">${state.profile?.full_name || ""} · ${roleLabel(state.profile?.role)}</div>
+          </div>
+          <div class="top-actions">
+            <span class="pill">Stock: ${fmt(stockActuel())} L</span>
+            <button class="btn ghost" id="logout-btn">Déconnexion</button>
+          </div>
+        </header>
+      `;
+    }
+
+    function navTabs(role){
+      if (role === "admin") {
+        return [
+          ["dashboard","Bilan"],
+          ["fuel","Saisies"],
+          ["pointage","Pointage"],
+          ["engins","Engins"],
+          ["export","Export"],
+        ];
+      }
+      if (role === "magasinier") return [["fuel","Saisie carburant"],["history","Historique"]];
+      return [["pointage","Pointage"],["summary","Résumé"]];
+    }
+
+    function renderApp(tab = null){
+      const defaultTab = tab || (state.profile?.role === "admin" ? "dashboard" : state.profile?.role === "magasinier" ? "fuel" : "pointage");
+      el("#app").innerHTML = `
+        ${pageHeader()}
+        <div class="nav-tabs">
+          ${navTabs(state.profile.role).map(([id,label]) => `
+            <button class="tab-btn ${id===defaultTab ? "active" : ""}" data-tab="${id}">${label}</button>
+          `).join("")}
+        </div>
+        <main class="main-grid" id="main-view"></main>
+      `;
+      el("#logout-btn").onclick = () => supabase.auth.signOut();
+      els("[data-tab]").forEach(btn => btn.onclick = () => renderApp(btn.dataset.tab));
+      renderTab(defaultTab);
+    }
+
+    function renderTab(tab){
+      const main = el("#main-view");
+      if (tab === "dashboard") return renderAdminDashboard(main);
+      if (tab === "fuel") return renderFuel(main);
+      if (tab === "history") return renderHistory(main);
+      if (tab === "pointage") return renderPointage(main);
+      if (tab === "summary") return renderPointageSummary(main);
+      if (tab === "engins") return renderEngins(main);
+      if (tab === "export") return renderExport(main);
+      main.innerHTML = `<section class="card"><p>Page non trouvée.</p></section>`;
+    }
+
+    function renderKpis(){
+      const totalE = state.saisies.filter(x => x.type_mouvement === "E").reduce((a,x)=>a+Number(x.quantite_l||0),0);
+      const totalS = state.saisies.filter(x => x.type_mouvement === "S").reduce((a,x)=>a+Number(x.quantite_l||0),0);
+      return `
+        <div class="kpis">
+          <div class="kpi"><span>Entrées</span><strong>${fmt(totalE)} L</strong></div>
+          <div class="kpi"><span>Sorties</span><strong>${fmt(totalS)} L</strong></div>
+          <div class="kpi"><span>Stock</span><strong>${fmt(totalE-totalS)} L</strong></div>
+          <div class="kpi"><span>Saisies</span><strong>${state.saisies.length}</strong></div>
+        </div>
+      `;
+    }
+
+    function renderAdminDashboard(main){
+      const topEngins = Object.entries(
+        state.saisies
+          .filter(x => x.type_mouvement === "S")
+          .reduce((acc, row) => {
+            const nom = row.engins?.nom || "Sans engin";
+            acc[nom] = (acc[nom] || 0) + Number(row.quantite_l || 0);
+            return acc;
+          }, {})
+      ).sort((a,b)=>b[1]-a[1]).slice(0,10);
+
+      main.innerHTML = `
+        <section class="card span-2">
+          <h3>Bilan global</h3>
+          ${renderKpis()}
+        </section>
+        <section class="card span-2">
+          <h3>Top consommation par engin</h3>
+          <div class="list">
+            ${topEngins.length ? topEngins.map(([nom,val]) => `
+              <div class="row between"><span>${nom}</span><strong>${fmt(val)} L</strong></div>
+            `).join("") : `<div class="muted">Aucune donnée.</div>`}
+          </div>
+        </section>
+        <section class="card span-2">
+          <h3>Dernières saisies</h3>
+          ${historyTable(state.saisies.slice(0,10))}
+        </section>
+      `;
+    }
+
+    function fuelForm(){
+      return `
+        <form id="fuel-form" class="stack">
+          <div class="grid-2">
+            <div>
+              <label>Date</label>
+              <input type="date" id="fuel-date" value="${today()}" required />
+            </div>
+            <div>
+              <label>Type</label>
+              <select id="fuel-type">
+                <option value="E">Entrée</option>
+                <option value="S">Sortie</option>
+              </select>
+            </div>
+          </div>
+          <div class="grid-2">
+            <div>
+              <label>Engin</label>
+              <select id="fuel-engin">
+                <option value="">— Aucun / Entrée générale —</option>
+                ${state.engins.filter(e => e.is_active).map(e => `<option value="${e.id}">${e.nom}</option>`).join("")}
+              </select>
+            </div>
+            <div>
+              <label>Affectation</label>
+              <select id="fuel-affectation">
+                ${AFFECTATIONS.map(a => `<option value="${a}">${a}</option>`).join("")}
+              </select>
+            </div>
+          </div>
+          <div class="grid-2">
+            <div>
+              <label>Quantité (L)</label>
+              <input type="number" step="0.01" id="fuel-qty" required placeholder="0" />
+            </div>
+            <div>
+              <label>Commentaire</label>
+              <input type="text" id="fuel-comment" placeholder="Optionnel" />
+            </div>
+          </div>
+          <button class="btn primary">Enregistrer</button>
+        </form>
+      `;
+    }
+
+    function renderFuel(main){
+      main.innerHTML = `
+        <section class="card">
+          <h3>Nouvelle saisie carburant</h3>
+          ${fuelForm()}
+        </section>
+        <section class="card span-2">
+          <h3>Historique récent</h3>
+          ${historyTable(state.saisies.slice(0,20), true)}
+        </section>
+      `;
+      el("#fuel-form").onsubmit = async (e) => {
+        e.preventDefault();
+        try {
+          const type = el("#fuel-type").value;
+          const engin_id = el("#fuel-engin").value || null;
+          if (type === "S" && !engin_id) throw new Error("Une sortie doit être liée à un engin.");
+          const payload = {
+            date_saisie: el("#fuel-date").value,
+            type_mouvement: type,
+            engin_id,
+            quantite_l: Number(el("#fuel-qty").value),
+            affectation: el("#fuel-affectation").value,
+            commentaire: el("#fuel-comment").value.trim() || null,
+            created_by: state.session.user.id,
+          };
+          const { error } = await supabase.from("saisies_carburant").insert(payload);
+          if (error) throw error;
+          await loadAllData();
+          renderApp("fuel");
+          toast("Saisie enregistrée", "ok");
+        } catch (err) {
+          toast(err.message || "Erreur d'enregistrement", "err");
+        }
+      };
+      el("#fuel-type").onchange = () => {
+        const type = el("#fuel-type").value;
+        if (type === "E") el("#fuel-engin").value = "";
+      };
+    }
+
+    function historyTable(rows, showDelete=false){
+      return `
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Type</th>
+                <th>Engin</th>
+                <th>Affectation</th>
+                <th>Qté</th>
+                ${showDelete && state.profile?.role === "admin" ? "<th></th>" : ""}
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.length ? rows.map(r => `
+                <tr>
+                  <td>${fmtDate(r.date_saisie)}</td>
+                  <td><span class="badge ${r.type_mouvement === "E" ? "green" : "red"}">${r.type_mouvement === "E" ? "Entrée" : "Sortie"}</span></td>
+                  <td>${r.engins?.nom || "—"}</td>
+                  <td>${r.affectation || "—"}</td>
+                  <td><strong>${fmt(r.quantite_l)} L</strong></td>
+                  ${showDelete && state.profile?.role === "admin" ? `<td><button class="btn danger small" data-del="${r.id}">Suppr.</button></td>` : ""}
+                </tr>
+              `).join("") : `<tr><td colspan="${showDelete && state.profile?.role === "admin" ? 6 : 5}" class="muted center">Aucune donnée.</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    function renderHistory(main){
+      main.innerHTML = `
+        <section class="card span-2">
+          <h3>Historique complet</h3>
+          ${historyTable(state.saisies, false)}
+        </section>
+      `;
+    }
+
+    function renderPointage(main){
+      const byDate = state.pointages.filter(p => p.date_pointage === state.currentDate)
+        .reduce((acc, row) => { acc[row.engin_id] = row; return acc; }, {});
+      main.innerHTML = `
+        <section class="card span-2">
+          <div class="row between wrap">
+            <div>
+              <h3>Pointage engins</h3>
+              <p class="muted">Saisie par date pour chaque engin.</p>
+            </div>
+            <div>
+              <label>Date</label>
+              <input type="date" id="pt-date" value="${state.currentDate}" />
+            </div>
+          </div>
+          <form id="pointage-form" class="list stack">
+            ${state.engins.filter(e => e.is_active).map(e => `
+              <div class="row between wrap item">
+                <div>
+                  <strong>${e.nom}</strong>
+                  <div class="muted small">${e.categorie || "—"} · ${e.affectation_defaut || "—"}</div>
+                </div>
+                <input class="mini-input" type="number" min="0" max="31" step="0.5" name="engin_${e.id}" value="${byDate[e.id]?.jours_travailles ?? ""}" placeholder="0" />
+              </div>
+            `).join("")}
+            <button class="btn primary">Enregistrer le pointage</button>
+          </form>
+        </section>
+      `;
+      el("#pt-date").onchange = () => {
+        state.currentDate = el("#pt-date").value;
+        renderApp("pointage");
+      };
+      el("#pointage-form").onsubmit = async (e) => {
+        e.preventDefault();
+        try {
+          const rows = state.engins.filter(x => x.is_active).map(engin => {
+            const value = Number((e.target[`engin_${engin.id}`].value || "").trim() || 0);
+            return {
+              date_pointage: state.currentDate,
+              engin_id: engin.id,
+              jours_travailles: value,
+              created_by: state.session.user.id,
+            };
+          }).filter(r => r.jours_travailles > 0);
+          const existingIds = state.pointages.filter(p => p.date_pointage === state.currentDate).map(p => p.id);
+          if (existingIds.length) {
+            await supabase.from("pointages_engins").delete().in("id", existingIds);
+          }
+          if (rows.length) {
+            const { error } = await supabase.from("pointages_engins").insert(rows);
+            if (error) throw error;
+          }
+          await loadAllData();
+          renderApp("pointage");
+          toast("Pointage enregistré", "ok");
+        } catch (err) {
+          toast(err.message || "Erreur pointage", "err");
+        }
+      };
+    }
+
+    function renderPointageSummary(main){
+      const agg = Object.entries(
+        state.pointages.reduce((acc, row) => {
+          const nom = row.engins?.nom || "Sans engin";
+          acc[nom] = (acc[nom] || 0) + Number(row.jours_travailles || 0);
+          return acc;
+        }, {})
+      ).sort((a,b) => b[1]-a[1]);
+      main.innerHTML = `
+        <section class="card span-2">
+          <h3>Résumé pointage</h3>
+          <div class="list">
+            ${agg.length ? agg.map(([nom, val]) => `
+              <div class="row between"><span>${nom}</span><strong>${fmt(val)} j</strong></div>
+            `).join("") : `<div class="muted">Aucun pointage.</div>`}
+          </div>
+        </section>
+      `;
+    }
+
+    function renderEngins(main){
+      main.innerHTML = `
+        <section class="card">
+          <h3>Ajouter un engin</h3>
+          <form id="engin-form" class="stack">
+            <label>Nom</label>
+            <input type="text" id="engin-nom" required placeholder="Nom de l'engin" />
+            <label>Catégorie</label>
+            <input type="text" id="engin-cat" placeholder="Engins lourds / Matériel / Véhicules..." />
+            <label>Affectation par défaut</label>
+            <select id="engin-aff">
+              ${AFFECTATIONS.map(a => `<option value="${a}">${a}</option>`).join("")}
+            </select>
+            <button class="btn primary">Ajouter</button>
+          </form>
+        </section>
+        <section class="card span-2">
+          <h3>Liste des engins</h3>
+          <div class="list">
+            ${state.engins.map(e => `
+              <div class="row between wrap item">
+                <div>
+                  <strong>${e.nom}</strong>
+                  <div class="muted small">${e.categorie || "—"} · ${e.affectation_defaut || "—"}</div>
+                </div>
+                <div class="row">
+                  <span class="badge ${e.is_active ? "green" : "gray"}">${e.is_active ? "Actif" : "Inactif"}</span>
+                  <button class="btn ghost small" data-toggle-engin="${e.id}" data-active="${e.is_active}">${e.is_active ? "Désactiver" : "Activer"}</button>
+                </div>
+              </div>
+            `).join("")}
+          </div>
+        </section>
+      `;
+      el("#engin-form").onsubmit = async (e) => {
+        e.preventDefault();
+        try {
+          const payload = {
+            nom: el("#engin-nom").value.trim(),
+            categorie: el("#engin-cat").value.trim() || null,
+            affectation_defaut: el("#engin-aff").value,
+            is_active: true,
+          };
+          const { error } = await supabase.from("engins").insert(payload);
+          if (error) throw error;
+          await loadAllData();
+          renderApp("engins");
+          toast("Engin ajouté", "ok");
+        } catch (err) {
+          toast(err.message || "Erreur ajout engin", "err");
+        }
+      };
+      els("[data-toggle-engin]").forEach(btn => btn.onclick = async () => {
+        try {
+          const id = btn.dataset.toggleEngin;
+          const active = btn.dataset.active === "true";
+          const { error } = await supabase.from("engins").update({ is_active: !active }).eq("id", id);
+          if (error) throw error;
+          await loadAllData();
+          renderApp("engins");
+          toast("Statut mis à jour", "ok");
+        } catch (err) {
+          toast(err.message || "Erreur", "err");
+        }
+      });
+    }
+
+    function renderExport(main){
+      main.innerHTML = `
+        <section class="card">
+          <h3>Export CSV</h3>
+          <div class="stack">
+            <button class="btn primary" id="exp-saisies">Exporter les saisies carburant</button>
+            <button class="btn primary" id="exp-pointage">Exporter le pointage</button>
+          </div>
+        </section>
+        <section class="card span-2">
+          <h3>Rappel déploiement</h3>
+          <ul class="notes">
+            <li>Créer les tables avec le fichier <code>schema.sql</code>.</li>
+            <li>Créer un premier utilisateur dans l'application.</li>
+            <li>Passer ce premier utilisateur en <strong>admin</strong> dans la table <code>profiles</code>.</li>
+            <li>Déployer ce <code>index.html</code> sur Vercel, Netlify ou GitHub Pages.</li>
+          </ul>
+        </section>
+      `;
+      el("#exp-saisies").onclick = () => {
+        const rows = [["Date","Type","Engin","Affectation","Quantité_L","Commentaire"]].concat(
+          state.saisies.map(r => [r.date_saisie, r.type_mouvement, r.engins?.nom || "", r.affectation || "", r.quantite_l, r.commentaire || ""])
+        );
+        downloadCsv(`saisies_carburant_${today()}.csv`, rows);
+      };
+      el("#exp-pointage").onclick = () => {
+        const rows = [["Date","Engin","Jours_travaillés"]].concat(
+          state.pointages.map(r => [r.date_pointage, r.engins?.nom || "", r.jours_travailles])
+        );
+        downloadCsv(`pointage_engins_${today()}.csv`, rows);
+      };
+    }
+
+    async function refresh(){
+      try {
+        const { data } = await supabase.auth.getSession();
+        state.session = data.session;
+        if (!state.session) {
+          state.profile = null;
+          renderAuth();
+          return;
+        }
+        await loadProfile();
+        if (!state.profile) {
+          el("#app").innerHTML = `
+            <section class="auth-wrap">
+              <div class="auth-card">
+                <h2>Profil manquant</h2>
+                <p class="sub">Complète ton profil pour accéder à l'application.</p>
+                <form id="profile-form" class="stack">
+                  <label>Nom complet</label>
+                  <input type="text" id="pf-name" required placeholder="Nom Prénom" />
+                  <label>Rôle</label>
+                  <select id="pf-role">
+                    <option value="magasinier">Magasinier</option>
+                    <option value="pointeur">Pointeur</option>
+                  </select>
+                  <button class="btn primary">Créer mon profil</button>
+                </form>
+              </div>
+            </section>
+          `;
+          el("#profile-form").onsubmit = async (e) => {
+            e.preventDefault();
+            try {
+              await ensureProfile(state.session.user, el("#pf-name").value.trim(), el("#pf-role").value);
+              await refresh();
+            } catch (err) {
+              toast(err.message || "Erreur profil", "err");
+            }
+          };
+          return;
+        }
+        await bootstrapIfNeeded();
+        await loadAllData();
+        renderApp();
+      } catch (err) {
+        el("#app").innerHTML = `<section class="auth-wrap"><div class="auth-card"><h2>Erreur</h2><p>${err.message}</p></div></section>`;
+      }
+    }
+
+    supabase.auth.onAuthStateChange(async () => {
+      await refresh();
+    });
+
+    window.addEventListener("DOMContentLoaded", refresh);
+  </script>
+  <style>
+    :root{
+      --bg:#f5f7fb; --card:#ffffff; --text:#15202b; --muted:#6b7280;
+      --line:#e5e7eb; --primary:#1f4b99; --green:#18864b; --red:#c0392b;
+      --shadow:0 8px 30px rgba(15, 23, 42, .08);
+      --radius:18px;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+    .auth-wrap{min-height:100vh;display:grid;place-items:center;padding:24px}
+    .auth-card,.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+    .auth-card{width:min(100%,440px);padding:28px}
+    .brand{font-size:52px}
+    h1,h2,h3{margin:0 0 10px}
+    .sub,.muted{color:var(--muted)}
+    .small{font-size:12px}
+    .center{text-align:center}
+    .stack{display:grid;gap:12px}
+    label{font-size:13px;font-weight:600;color:#374151}
+    input,select,button{font:inherit}
+    input,select{width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--line);background:#fff}
+    .btn{border:none;border-radius:12px;padding:12px 16px;font-weight:700;cursor:pointer}
+    .btn.primary{background:var(--primary);color:#fff}
+    .btn.ghost{background:#fff;border:1px solid var(--line);color:var(--text)}
+    .btn.danger{background:#fff0ef;color:var(--red);border:1px solid #f3c6c0}
+    .btn.small{padding:7px 10px;font-size:12px}
+    .hidden{display:none!important}
+    .topbar{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;padding:20px 24px;background:#0f172a;color:#fff}
+    .topbar h2{margin-top:4px}
+    .eyebrow{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#9fb0d0}
+    .top-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .pill{display:inline-flex;padding:8px 12px;border-radius:999px;background:#16233f;color:#dbe6ff;font-weight:700}
+    .nav-tabs{display:flex;gap:10px;flex-wrap:wrap;padding:16px 24px}
+    .tab-btn{padding:10px 14px;border-radius:999px;border:1px solid var(--line);background:#fff;cursor:pointer}
+    .tab-btn.active{background:var(--primary);color:#fff;border-color:var(--primary)}
+    .tabs.small{margin:16px 0 18px}
+    .main-grid{display:grid;grid-template-columns:repeat(3, 1fr);gap:16px;padding:0 24px 24px}
+    .card{padding:18px}
+    .span-2{grid-column:span 2}
+    .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+    .kpi{padding:14px;border-radius:14px;background:#f8fafc;border:1px solid var(--line)}
+    .kpi span{display:block;color:var(--muted);font-size:13px;margin-bottom:4px}
+    .kpi strong{font-size:22px}
+    .row{display:flex;gap:10px;align-items:center}
+    .between{justify-content:space-between}
+    .wrap{flex-wrap:wrap}
+    .grid-2{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+    .table-wrap{overflow:auto}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:12px 10px;border-bottom:1px solid var(--line);text-align:left;font-size:14px}
+    th{font-size:12px;text-transform:uppercase;color:var(--muted)}
+    .badge{display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:700}
+    .badge.green{background:#eaf8ef;color:var(--green)}
+    .badge.red{background:#fdeeee;color:var(--red)}
+    .badge.gray{background:#f1f5f9;color:#475569}
+    .list{display:grid;gap:10px}
+    .item{padding:12px;border:1px solid var(--line);border-radius:14px}
+    .notes{margin:0;padding-left:18px;color:var(--muted)}
+    .mini-input{width:90px}
+    .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);opacity:0;transition:.25s;background:#111827;color:#fff;padding:12px 16px;border-radius:12px;box-shadow:var(--shadow)}
+    .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+    .toast.ok{background:var(--green)}
+    .toast.err{background:var(--red)}
+    code{background:#f3f4f6;padding:2px 6px;border-radius:8px}
+    @media (max-width: 980px){
+      .main-grid{grid-template-columns:1fr 1fr}
+      .span-2{grid-column:span 2}
+      .kpis{grid-template-columns:1fr 1fr}
+    }
+    @media (max-width: 720px){
+      .topbar,.nav-tabs,.main-grid{padding-left:14px;padding-right:14px}
+      .topbar{display:grid}
+      .main-grid{grid-template-columns:1fr}
+      .span-2{grid-column:span 1}
+      .grid-2,.kpis{grid-template-columns:1fr}
+      .auth-card{padding:20px}
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="toast" class="toast"></div>
+</body>
+</html>
